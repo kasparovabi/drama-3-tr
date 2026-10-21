@@ -8,8 +8,10 @@ fish-speech/
 .venv/
 __pycache__/
 release/hf/
-release/blog.md
-release/freya_message.md
+release/blog*.md
+release/freya_message*.md
+release/linkedin.md
+release/reddit.md
 release/samples.json
 ref/*.wav
 ref/*.txt

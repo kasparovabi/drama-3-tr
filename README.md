@@ -25,7 +25,7 @@ Tested on Windows 11, Python 3.13, torch 2.14.1+cu132 and triton-windows 3.8.
 git clone https://github.com/kasparovabi/drama-3-tr && cd drama-3-tr
 git clone https://github.com/fishaudio/fish-speech && git -C fish-speech checkout 5415669
 hf download fishaudio/drama-3 --local-dir models/drama-3
-hf download kasparovabi/drama-3-tr-speaker speaker.safetensors --local-dir .
+hf download kasparovabi/drama-3-tr-speaker speaker.safetensors config.json --local-dir .
 pip install torch triton-windows safetensors tokenizers soundfile omegaconf hydra-core scipy psutil einops einx loguru descript-audio-codec
 ```
 
