@@ -8,24 +8,28 @@ import numpy as np
 import soundfile as sf
 import torch
 
-from engine import OnDemandExperts, PrefixCache, StreamDecoder, attach_speaker, build_model, synthesize
+from engine import OnDemandExperts, PrefixCache, StreamDecoder, attach_speaker, build_model, hot_experts, synthesize
 from prepare_data import encode, load_codec
 
 SENTENCES = [
     "Selam dostum, bugün nasılsın?",
     "[heyecanla] Harika bir haberim var, sonunda robot kolum çalıştı!",
-    "[sıcak ve gizemli bir masalcı gibi] Bugün sana küçük bir hikâye anlatacağım. Bir zamanlar, denizin kıyısında küçük bir kasaba varmış. [gülerek] Kasabanın kedisi her sabah balıkçıların teknesine gizlice binermiş.",
+    "[ciddi] Bu hafta gündemde yine aynı tartışma var.",
+    "[hafifçe gülerek] Bunu duyunca ben de inanamadım açıkçası.",
+    "[samimi] Bugün sana küçük bir hikâye anlatacağım. Bir zamanlar, denizin kıyısında küçük bir kasaba varmış. Kasabanın kedisi her sabah balıkçıların teknesine gizlice binermiş.",
 ]
 
-model, store = build_model(300)
+model, store = build_model(300, disk=True)
+store.pin_hot(hot_experts(int(os.getenv("HOT", "6000"))))
 attach_speaker(model, "speaker.safetensors")
 OnDemandExperts.batch = 2
 codec = load_codec()
-audio, sr = sf.read("ref/tikir_long.wav", dtype="float32")
+REF = os.getenv("REF", "ref/tikir_long")
+audio, sr = sf.read(REF + ".wav", dtype="float32")
 ref_codes = encode(codec, audio if audio.ndim == 1 else audio.mean(1), sr).long()
-ref_text = open("ref/tikir_long.txt", encoding="utf-8").read().strip()
+ref_text = open(REF + ".txt", encoding="utf-8").read().strip()
 prefix = PrefixCache(model, ref_text, ref_codes)
-opts = dict(temperature=1.0, top_p=0.9, strength=4.0)
+opts = dict(temperature=1.0, top_p=0.9, strength=2.0)
 synthesize(model, prefix, codec, "Merhaba.", ref_codes, ref_text, **opts)
 
 SR = codec.sample_rate

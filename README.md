@@ -2,7 +2,7 @@
 
 # drama-3-tr
 
-Run Fish Audio Drama 3 in Turkish on a single 16 GB GPU, close to real time for short sentences and almost twice as fast for paragraphs, with its inline directions and emotion intact. The full model reads the prompt, a distilled 32-expert speaker generates the audio, and experts are streamed from the NVMe drive so the 41.5 GB checkpoint never has to sit in RAM.
+Run Fish Audio Drama 3 in Turkish on a single 16 GB GPU, about 2.7 times faster than real time for short sentences and about 3.3 times for paragraphs, with its inline directions and emotion intact. The full model reads the prompt, a distilled 32-expert speaker generates the audio, and experts are streamed from the NVMe drive so the 41.5 GB checkpoint never has to sit in RAM.
 
 Weights and full results are on Hugging Face at [kasparovabi/drama-3-tr-speaker](https://huggingface.co/kasparovabi/drama-3-tr-speaker). How it was built is written up on [dev.to](https://dev.to/kasparovabi/teaching-a-35b-voice-model-to-speak-turkish-on-one-16-gb-card-1ppl) and in Turkish on [Medium](https://medium.com/@snth9/35-milyar-parametrelik-ses-modelini-tek-16-gb-kartta-t%C3%BCrk%C3%A7e-konu%C5%9Fturmak-246e3f624260).
 
@@ -12,12 +12,13 @@ Weights and full results are on Hugging Face at [kasparovabi/drama-3-tr-speaker]
 
 | | Value |
 |---|---|
-| Freya-TR-Eval WER and CER (495 sentences, Freya's protocol) | 2.68% and 0.70% without guidance, 2.78% and 0.67% with guidance in disk mode |
+| Freya-TR-Eval WER and CER (495 sentences, Freya's protocol), guidance 4, disk mode with hot tier | 2.27% and 0.62% |
 | Teacher-forced KL to unmodified Drama 3 (200 held-out utterances) | 0.066 |
-| Speed on RTX 5070 Ti, experts in RAM | 1.2x real time for short sentences, 1.7 to 1.9x for paragraphs |
-| Speed with experts read from disk, guidance on | 0.86x real time for short sentences |
-| First audio with streaming decode, experts in RAM | 1.15 s (short sentence) |
-| VRAM and system RAM | 14.2 GiB, and 4.4 GB of RAM while generating (9.3 GB peak while loading) |
+| Short sentences on RTX 5070 Ti (Freya-TR-Eval, median 3.5 s), disk mode with hot tier, compiled | 2.7x real time (median) |
+| Paragraphs of 16 to 20 s, same setup | 3.2 to 3.4x real time in five of six runs, 1.9x in one |
+| Short sentences, disk mode without the hot tier, compiled | 1.2x real time (median) |
+| VRAM | 14.0 GiB peak on short sentences, 15.0 GiB on paragraphs |
+| System RAM | 25 GB with the 6,000-expert hot tier, 4.9 GB without it |
 
 ## Setup
 
@@ -28,6 +29,7 @@ git clone https://github.com/kasparovabi/drama-3-tr && cd drama-3-tr
 git clone https://github.com/fishaudio/fish-speech && git -C fish-speech checkout 5415669
 hf download fishaudio/drama-3 --local-dir models/drama-3
 hf download kasparovabi/drama-3-tr-speaker speaker.safetensors config.json --local-dir .
+hf download kasparovabi/drama-3-tr-speaker trace_experts.pt --local-dir results
 pip install torch triton-windows safetensors tokenizers soundfile omegaconf hydra-core scipy psutil einops einx loguru descript-audio-codec
 ```
 
@@ -36,11 +38,13 @@ pip install torch triton-windows safetensors tokenizers soundfile omegaconf hydr
 `sentences.json` is a JSON list of strings. Put directions in square brackets, in Turkish.
 
 ```bash
-python engine.py --speaker speaker.safetensors --graph --slots 300 --disk \
+TTS_COMPILE=max-autotune-no-cudagraphs python engine.py --speaker speaker.safetensors --graph --slots 300 --disk --hot 6000 \
   --ref my_voice.wav --ref_text my_voice.txt --sentences sentences.json --out out
 ```
 
-`--cfg` sets the direction guidance strength (default 4, 0 turns it off) and `--seed` makes a run reproducible. `server.py` serves the same engine over HTTP (POST `/tts` with `{"text": ...}`, 16 kHz PCM back, or `"format": "wav"` for 44.1 kHz WAV). `streaming_demo.py` shows streaming playback, where audio is decoded while frames are still being generated.
+`--hot 6000` keeps the 6,000 experts that Turkish prompts use most in pinned RAM (18.6 GB), chosen from `results/trace_experts.pt`. Leave it out on a machine with less than 32 GB of RAM, every expert then comes from the drive. `TTS_COMPILE` compiles the per-frame step with `torch.compile` before it is captured in a CUDA graph, which adds a few minutes to start-up. `TTS_FP8=1` also stores the dense attention, DeltaNet and audio decoder weights in block FP8. It is about 8% faster but raised Freya-TR-Eval WER to 3.29% in our run, so it is off by default.
+
+`--cfg` sets the direction guidance strength (default 4, 0 turns it off) and `--seed` makes a run reproducible. `server.py` serves the same engine over HTTP (POST `/tts` with `{"text": ...}`, 16 kHz PCM back, or `"format": "wav"` for 44.1 kHz WAV). It reads `TTS_HOT`, `TTS_COMPILE` and `TTS_FP8` from the environment and caps each take's length by the length of the text. With `TTS_CAMPPLUS` pointing at a seed-vc checkout it can generate `best_of` takes and keep the one closest to the reference voice. `streaming_demo.py` shows streaming playback, where audio is decoded while frames are still being generated.
 
 ## Evaluate on Freya-TR-Eval
 
@@ -50,6 +54,24 @@ Put `eval/benchmark.py` from the [FreyaTTS repository](https://github.com/freyav
 pip install faster-whisper jiwer librosa soxr
 python freya_score.py out/freya_tr_eval
 ```
+
+## Speed work
+
+The first release ran at 0.86x real time on short sentences in disk mode. These changes took it to about 2.7x.
+
+1. `torch.compile` on the per-frame step, then CUDA graph capture of the compiled code. Profiling showed more than 2,000 small elementwise and dtype cast kernels per frame around the matrix multiplications. A frame went from 22.7 ms to 13.6 ms.
+2. Logits only for the 4,097 tokens the audio head can sample (end of speech and the semantic codes) instead of the full 252k vocabulary. About 1 ms per frame, same output.
+3. In speaker mode the 256-expert router of every layer was still computed and then ignored. It is skipped now.
+4. A pinned RAM tier for the 6,000 experts that 300 traced Turkish sentences used most (`trace_experts.py`). Per sentence only about 40 experts still come from the drive.
+5. Reading the prompt turned out to be bound by Python, not by PCIe. Every expert load issued five separate copies. An expert's gate, up and down weights now share one contiguous GPU slot and the scales move with one gather per layer, which took prompt reading from about 0.65 s to about 0.42 s.
+
+Two things did not work. Prefetching the next layer's experts with its router applied to the current hidden state found 80 to 90% of them, but the wrong guesses evicted experts that were needed and reading got slower. And `pin_memory=True` rounds allocations up to a power of two, so the 18.6 GB hot tier took 32 GB of RAM until it was switched to `cudaHostRegister`.
+
+`fp8_linear.py` holds the optional block FP8 path. cuBLAS bf16 already reaches 85 to 90% of memory bandwidth on these batch-2 matrix-vector products, so only fewer bytes could make them faster. Row-wise scaled FP8 matmul is not available on sm120 in torch 2.14 and the compiler's weight-only FP8 path was slower than bf16, so it is a small Triton kernel that pads the two rows to a 16-row tensor core tile. A frame drops from 12.4 ms to 10.4 ms, but WER went up by about one point, which is why it stays optional.
+
+## Emotion intensity by activation steering
+
+`steer_act.py` takes the mean difference between the hidden states of the directed and the undirected prompt on identical text rows (the same two rows guidance already computes) and adds a multiple of it to one layer's output while the prompt is read. The sentence itself carries no direction. Layers 8 and 16 had no effect. At layers 24 to 28 with strength 2 to 3 it moves pitch and energy about as far as the real direction does for whispering and excitement, with Whisper WER at 0 to 2%. For sadness it moves less than the real direction but keeps the voice closer to the reference. Activation steering for emotion in TTS has been published before (EmoSteer-TTS, SteerSpeech). What it gives here is a continuous intensity knob. Biasing the 256-way router instead, in the spirit of SteerMoE, did not move prosody toward the direction.
 
 ## Train your own speaker
 
@@ -66,7 +88,12 @@ Distilling 32 experts per layer on 3,800 Turkish utterances takes about 85 minut
 
 | File | What it does |
 |---|---|
-| `engine.py` | Inference engine (reader, speaker, prefix cache, CUDA graphs, direction guidance, streaming decode) |
+| `engine.py` | Inference engine (reader, speaker, prefix cache, hot expert tier, CUDA graphs, direction guidance, streaming decode) |
+| `fp8_linear.py` | Optional block FP8 dense layers with a Triton matrix-vector kernel |
+| `trace_experts.py` | Counts which experts Turkish prompts use, the source of the hot tier |
+| `profile_short.py`, `profile_frame.py` | Per-sentence timing (prompt reading, drive, frames) and a per-frame kernel profile |
+| `runaway_rate.py` | How often each direction runs on past the end of the sentence |
+| `steer_act.py` | Emotion intensity by activation steering |
 | `checkpoint.py` | Read-only checkpoint access and single-layer loading for experiments |
 | `disk.py` | Unbuffered NVMe reader for experts |
 | `prepare_data.py` | Codec loading and ISSAI TSC encoding |

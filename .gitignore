@@ -22,3 +22,4 @@ d3_index.json
 *.pt
 *.safetensors
 *.log
+ref/*/

@@ -42,7 +42,7 @@ class DiskExperts:
                         spans.setdefault(root, {}).setdefault(path, {})[proj] = (start, end)
                     else:
                         f.seek(start)
-                        self.scales[(root, proj)] = torch.frombuffer(bytearray(f.read(end - start)), dtype=torch.float32).reshape(h["shape"])
+                        self.scales[(root, proj)] = torch.frombuffer(bytearray(f.read(end - start)), dtype=torch.float32).reshape(h["shape"]).cuda()
         size = 0
         for root, files in spans.items():
             pieces = []

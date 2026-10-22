@@ -16,6 +16,7 @@ from fish_speech.models.text2semantic.fish_omni.backbone import FishOmniBackbone
 from fish_speech.models.text2semantic.fish_omni.fp8_moe import fp8_moe_forward
 from fish_speech.models.text2semantic.fish_omni.generate import RAS_WINDOW_FRAMES, Drama3DecodeGraphs, build_drama3_prompt, ensure_drama3_caches
 from fish_speech.models.text2semantic.fish_omni.model import AUDIO_DECODER_PREFIXES, FishOmniModel
+from fish_speech.models.text2semantic.fish_omni.moe import SparseMoeBlock
 from fish_speech.models.text2semantic.fish_omni.tower import FishOmniAudioDecoder, load_audio_decoder_weights
 
 BF = torch.bfloat16
@@ -28,14 +29,50 @@ class ExpertStore:
     def __init__(self, cfg, weights, slots):
         I, H = cfg.text.moe_intermediate_size, cfg.text.hidden_size
         self.weights = weights
-        self.w13 = torch.empty((slots, 2 * I, H), dtype=torch.uint8, device="cuda")
-        self.w2 = torch.empty((slots, H, I), dtype=torch.uint8, device="cuda")
+        self.buf = torch.empty((slots, 3 * I * H), dtype=torch.uint8, device="cuda")
+        self.w13 = self.buf[:, : 2 * I * H].view(slots, 2 * I, H)
+        self.w2 = self.buf[:, 2 * I * H :].view(slots, H, I)
         self.s13 = torch.empty((slots, 2 * I // 128, H // 128), device="cuda")
         self.s2 = torch.empty((slots, H // 128, I // 128), device="cuda")
         self.lru = OrderedDict()
         self.free = list(range(slots))
         self.misses = self.hits = 0
         self.disk = None
+        self.hot = {}
+        self.tables = None
+
+    def pin_hot(self, keys):
+        d, I = self.disk, self.w13.shape[1] // 2
+        self.hot_buf = torch.empty((len(keys), self.buf.shape[1]), dtype=torch.uint8)
+        # pin_memory=True rounds up to a power of two (18.6 GB became 32 GB), registering pins exactly this size
+        assert torch.cuda.cudart().cudaHostRegister(self.hot_buf.data_ptr(), self.hot_buf.numel(), 0) == 0
+        split = self.w13[0].numel()
+        w13 = self.hot_buf[:, :split].view(len(keys), *self.w13.shape[1:])
+        w2 = self.hot_buf[:, split:].view(len(keys), *self.w2.shape[1:])
+        for b in range(0, len(keys), d.slots):
+            batch = keys[b : b + d.slots]
+            for i, (key, off) in enumerate(zip(batch, d.fetch(batch)), b):
+                w13[i, :I].copy_(d.view(off, "gate_proj").view(I, -1))
+                w13[i, I:].copy_(d.view(off, "up_proj").view(I, -1))
+                w2[i].copy_(d.view(off, "down_proj").view(-1, I))
+                self.hot[key] = i
+
+    def _set_scales(self, layer, pairs):
+        if not pairs:
+            return
+        if self.tables is None:
+            d, I = self.disk, self.w13.shape[1] // 2
+            layers, experts = (max(k[j] for k in d.where) + 1 for j in (0, 1))
+            s13 = torch.empty((layers, experts, *self.s13.shape[1:]), device="cuda")
+            s2 = torch.empty((layers, experts, *self.s2.shape[1:]), device="cuda")
+            for (l, e), (root, _) in d.where.items():
+                s13[l, e, : I // 128] = d.scales[(root, "gate_proj")]
+                s13[l, e, I // 128 :] = d.scales[(root, "up_proj")]
+                s2[l, e] = d.scales[(root, "down_proj")]
+            self.tables = s13, s2
+        index = torch.tensor(pairs, device="cuda").T
+        self.s13[index[1]] = self.tables[0][layer, index[0]]
+        self.s2[index[1]] = self.tables[1][layer, index[0]]
 
     def _load(self, layer, missing):
         I = self.w13.shape[1] // 2
@@ -53,19 +90,22 @@ class ExpertStore:
 
     def _load_from_disk(self, layer, missing, I):
         d = self.disk
-        for b in range(0, len(missing), d.slots):
-            batch = missing[b : b + d.slots]
-            keys = [(layer, e) for e, _ in batch]
-            offsets = d.fetch(keys)
-            for (e, s), k, off in zip(batch, keys, offsets):
-                root = d.where[k][0]
+        cold = []
+        for e, s in missing:
+            i = self.hot.get((layer, e))
+            if i is None:
+                cold.append((e, s))
+                continue
+            self.buf[s].copy_(self.hot_buf[i], non_blocking=True)
+        self._set_scales(layer, missing)
+        for b in range(0, len(cold), d.slots):
+            batch = cold[b : b + d.slots]
+            offsets = d.fetch([(layer, e) for e, _ in batch])
+            for (e, s), off in zip(batch, offsets):
                 v = lambda proj: d.view(off, proj)
                 self.w13[s, :I].copy_(v("gate_proj").view(I, -1), non_blocking=True)
                 self.w13[s, I:].copy_(v("up_proj").view(I, -1), non_blocking=True)
                 self.w2[s].copy_(v("down_proj").view(-1, I), non_blocking=True)
-                self.s13[s, : I // 128].copy_(d.scales[(root, "gate_proj")])
-                self.s13[s, I // 128 :].copy_(d.scales[(root, "up_proj")])
-                self.s2[s].copy_(d.scales[(root, "down_proj")])
             torch.cuda.current_stream().synchronize()
 
     def slots_for(self, layer, experts):
@@ -101,10 +141,30 @@ class OnDemandExperts(nn.Module):
         if self.reader is not None and OnDemandExperts.light:
             return self.reader(x)
         unique = ids.unique()
-        self.slot_map[unique] = torch.tensor(self.store.slots_for(self.layer, unique.tolist()), device="cuda")
         s = self.store
+        self.slot_map[unique] = torch.tensor(s.slots_for(self.layer, unique.tolist()), device="cuda")
         fp8 = torch.float8_e4m3fn
         return fp8_moe_forward(x, self.slot_map[ids], weights, s.w13.view(fp8), s.s13, s.w2.view(fp8), s.s2)
+
+
+routed_forward = SparseMoeBlock.forward
+
+
+def speaker_forward(self, x):
+    flat = x.reshape(-1, x.shape[-1])
+    e = self.experts
+    if e.speaker is None or flat.shape[0] > OnDemandExperts.batch:
+        return routed_forward(self, x)
+    return (e.speaker(flat) + torch.sigmoid(self.shared_expert_gate(flat)) * self.shared_expert(flat)).view_as(x)
+
+
+SparseMoeBlock.forward = speaker_forward
+
+
+def hot_experts(n, path="results/trace_experts.pt"):
+    counts = torch.load(path, map_location="cpu")["counts"].float()
+    top = counts.flatten().argsort(descending=True)[:n]
+    return [(int(i) // counts.shape[1], int(i) % counts.shape[1]) for i in top]
 
 
 @torch.no_grad()
@@ -138,6 +198,12 @@ def build_model(slots=1200, disk=False):
         tower,
         ((k, weights.get(k)) for k in weights.index if k.startswith(AUDIO_DECODER_PREFIXES)),
     )
+    if os.getenv("TTS_FP8"):
+        from fp8_linear import convert
+
+        convert(backbone.model)
+        convert(tower)
+        torch.cuda.empty_cache()
     if disk:
         weights.files.clear()
         store.weights = None
@@ -331,6 +397,14 @@ class CfgGraphs:
         self.top_k = torch.zeros((), dtype=torch.long, device="cuda")
         self.top_p = torch.zeros((), device="cuda")
         self.pool = torch.cuda.graph_pool_handle()
+        mode = os.getenv("TTS_COMPILE")
+        compile = (lambda f: torch.compile(f, dynamic=False, mode=mode)) if mode else (lambda f: f)
+        self.backbone = compile(model.backbone)
+        self.decode_step = compile(model.audio_decoder.decode_step)
+        tower = model.audio_decoder
+        self.candidates = torch.cat((torch.tensor([tower.eos_id]), torch.arange(tower.semantic_begin, tower.semantic_end + 1))).cuda()
+        self.head = model.backbone.lm_head.weight[self.candidates].contiguous()
+        self.logits = torch.full((1, model.backbone.lm_head.out_features), -torch.inf, device="cuda")
         self.buckets = tuple(sorted({min(b, capacity) for b in (1024, 2048, 4096, capacity)}))
         self.graphs = {}
         for kv in self.buckets:
@@ -342,15 +416,15 @@ class CfgGraphs:
 
     def run(self, kv):
         backbone, tower = self.model.backbone, self.model.audio_decoder
-        logits = backbone.compute_logits(self.hidden).float()
-        guided = logits[1:] + self.strength * (logits[:1] - logits[1:])
-        sample = tower.decode_step(
+        logits = (self.hidden @ self.head.T).float()
+        guided = self.logits.index_copy(1, self.candidates, logits[1:] + self.strength * (logits[:1] - logits[1:]))
+        sample = self.decode_step(
             guided, self.hidden[:1], self.pos, self.frame, self.history,
             temperature=self.temperature, top_k=self.top_k, top_p=self.top_p, check_finite=False,
         )
         self.sample.copy_(sample)
         g = tower.embed_backbone(sample, backbone.embed(sample[:, 0]))
-        h = backbone(inputs_embeds=g[None].expand(2, -1, -1).contiguous(), input_pos=self.pos + 1, static_kv_len=kv)
+        h = self.backbone(inputs_embeds=g[None].expand(2, -1, -1).contiguous(), input_pos=self.pos + 1, static_kv_len=kv)
         self.next.copy_(h[:, 0])
 
     def capture(self, kv):
@@ -504,6 +578,7 @@ def main():
     p.add_argument("--slots", type=int, default=1200)
     p.add_argument("--graph", action="store_true")
     p.add_argument("--disk", action="store_true")
+    p.add_argument("--hot", type=int, default=0)
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--top_p", type=float, default=0.9)
     p.add_argument("--cfg", type=float, default=4.0)
@@ -511,6 +586,8 @@ def main():
     a = p.parse_args()
     os.makedirs(a.out, exist_ok=True)
     model, store = build_model(a.slots, a.disk)
+    if a.hot:
+        store.pin_hot(hot_experts(a.hot))
     if a.speaker:
         attach_speaker(model, a.speaker)
         if a.graph:
