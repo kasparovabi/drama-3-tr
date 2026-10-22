@@ -1,8 +1,10 @@
+<p align="center"><img src="assets/banner.png" alt="drama-3-tr: Drama 3 in Turkish on one 16 GB GPU" width="100%"></p>
+
 # drama-3-tr
 
 Run Fish Audio Drama 3 in Turkish on a single 16 GB GPU, close to real time for short sentences and almost twice as fast for paragraphs, with its inline directions and emotion intact. The full model reads the prompt, a distilled 32-expert speaker generates the audio, and experts are streamed from the NVMe drive so the 41.5 GB checkpoint never has to sit in RAM.
 
-Weights and full results are on Hugging Face at [kasparovabi/drama-3-tr-speaker](https://huggingface.co/kasparovabi/drama-3-tr-speaker).
+Weights and full results are on Hugging Face at [kasparovabi/drama-3-tr-speaker](https://huggingface.co/kasparovabi/drama-3-tr-speaker). How it was built is written up on [dev.to](https://dev.to/kasparovabi/teaching-a-35b-voice-model-to-speak-turkish-on-one-16-gb-card-1ppl) and in Turkish on [Medium](https://medium.com/@snth9/35-milyar-parametrelik-ses-modelini-tek-16-gb-kartta-t%C3%BCrk%C3%A7e-konu%C5%9Fturmak-246e3f624260).
 
 **Built with Fish Audio.** This project uses [Fish Audio Drama 3](https://huggingface.co/fishaudio/drama-3) and [fish-speech](https://github.com/fishaudio/fish-speech). It is not affiliated with or endorsed by Fish Audio.
 
