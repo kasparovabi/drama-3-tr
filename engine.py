@@ -347,23 +347,25 @@ def generate_frames(model, prefix, prompt, max_frames, temperature, top_k, top_p
 
 
 def strip_directions(prompt, tok, start):
-    """Replaces text tokens inside square brackets with spaces, so length and positions stay the same."""
+    """Replaces text tokens inside [square] and <scoped> tag markup with spaces, so length and positions stay the same."""
     plain = prompt.clone()
     space, inside = tok.encode(" ").ids[0], False
     for i in range(start, len(prompt)):
         if prompt[i, 1:].any():
             continue
         piece = tok.id_to_token(int(prompt[i, 0])) or ""
-        if "[" in piece:
+        if piece.startswith("<|"):
+            continue
+        if "[" in piece or "<" in piece:
             inside = True
         if inside:
             plain[i, 0] = space
-        if "]" in piece:
+        if "]" in piece or ">" in piece:
             inside = False
     return plain
 
 
-def read_prompt_cfg(model, prefix, fA, fB, pos, n):
+def read_prompt_cfg(model, prefix, fA, fB, pos, n, start=None):
     backbone, tower = model.backbone, model.audio_decoder
 
     def read(a, b):
@@ -376,8 +378,9 @@ def read_prompt_cfg(model, prefix, fA, fB, pos, n):
                 tower.prefill(hidden[0, : paired - s], pos[s:paired], fA[s:paired], fA[s + 1 : paired + 1])
         return hidden
 
-    prefix.restore_or_read(fA, read)
-    return read(prefix.length, n)[:, -1]
+    if start is None:
+        prefix.restore_or_read(fA, read)
+    return read(prefix.length if start is None else start, n)[:, -1]
 
 
 class CfgGraphs:
@@ -396,6 +399,7 @@ class CfgGraphs:
         self.temperature = torch.zeros((), device="cuda")
         self.top_k = torch.zeros((), dtype=torch.long, device="cuda")
         self.top_p = torch.zeros((), device="cuda")
+        self.score = torch.zeros((), device="cuda")
         self.pool = torch.cuda.graph_pool_handle()
         mode = os.getenv("TTS_COMPILE")
         compile = (lambda f: torch.compile(f, dynamic=False, mode=mode)) if mode else (lambda f: f)
@@ -423,6 +427,7 @@ class CfgGraphs:
             temperature=self.temperature, top_k=self.top_k, top_p=self.top_p, check_finite=False,
         )
         self.sample.copy_(sample)
+        self.score.add_(direction_score(logits, sample[0, 0], tower))
         g = tower.embed_backbone(sample, backbone.embed(sample[:, 0]))
         h = self.backbone(inputs_embeds=g[None].expand(2, -1, -1).contiguous(), input_pos=self.pos + 1, static_kv_len=kv)
         self.next.copy_(h[:, 0])
@@ -456,6 +461,7 @@ class CfgGraphs:
         self.temperature.fill_(temperature)
         self.top_k.fill_(top_k)
         self.top_p.fill_(top_p)
+        self.score.zero_()
 
     def step(self, pos):
         self.graphs[next(b for b in self.buckets if b >= pos + 2)].replay()
@@ -465,6 +471,12 @@ class CfgGraphs:
         self.history.copy_(torch.cat((self.history[1:], sample[0, :1])))
         self.pos.add_(1)
         return sample, int(sample[0, 0])
+
+
+def direction_score(logits, token, tower):
+    index = torch.where(token == tower.eos_id, 0, token - tower.semantic_begin + 1)
+    picked = torch.log_softmax(logits.float(), dim=-1).index_select(1, index.view(1))
+    return (picked[0] - picked[1]).squeeze()
 
 
 @torch.inference_mode()
@@ -477,13 +489,15 @@ def generate_frames_cfg(model, prefix, prompt, strength, max_frames, temperature
         tower.setup_caches(capacity)
         model.cache_capacity = capacity
         model.cfg_graphs = CfgGraphs(model, capacity) if os.environ.get("FISH_DRAMA3_CUDA_GRAPH") == "1" else None
-        prefix.rows = None
+        prefix.rows = model.cfg_session = None
     fA = torch.zeros((n + max_frames, prompt.shape[1]), dtype=torch.long, device="cuda")
     fA[:n] = prompt.cuda()
     fB = fA.clone()
     fB[:n] = strip_directions(prompt, model.tokenizer, prefix.length).cuda()
     pos = torch.arange(n + max_frames, device="cuda")
-    hidden = read_prompt_cfg(model, prefix, fA, fB, pos, n)
+    rows = model.cfg_session["rows"] if getattr(model, "cfg_session", None) else None
+    start = len(rows) if rows is not None and len(rows) < n and torch.equal(prompt[: len(rows)], rows) else None
+    hidden = read_prompt_cfg(model, prefix, fA, fB, pos, n, start)
     made, stop = 0, "length"
     graphs = model.cfg_graphs
     if graphs is not None:
@@ -497,7 +511,9 @@ def generate_frames_cfg(model, prefix, prompt, strength, max_frames, temperature
             made += 1
             if stream:
                 stream(fA[n : n + made])
-        return fA[n : n + made].cpu(), stop
+        return fA[n : n + made].cpu(), stop, graphs.score.item() / (made + 1)
+    score = 0.0
+    candidates = torch.cat((torch.tensor([tower.eos_id]), torch.arange(tower.semantic_begin, tower.semantic_end + 1))).cuda()
     for step in range(max_frames):
         k = n - 1 + step
         logits = backbone.compute_logits(hidden).float()
@@ -506,6 +522,7 @@ def generate_frames_cfg(model, prefix, prompt, strength, max_frames, temperature
             guided, hidden[:1], pos[k : k + 1], fA[k : k + 1], fA[: k + 1, 0],
             temperature=temperature, top_k=top_k, top_p=top_p,
         )
+        score += direction_score(logits[:, candidates], sample[0, 0], tower).item()
         if sample[0, 0].item() == model.config.eos_token_id:
             stop = "eos"
             break
@@ -515,7 +532,7 @@ def generate_frames_cfg(model, prefix, prompt, strength, max_frames, temperature
             stream(fA[n : n + made])
         g = tower.embed_backbone(sample, backbone.embed(sample[:, 0]))
         hidden = backbone(inputs_embeds=g[None].expand(2, -1, -1).contiguous(), input_pos=pos[k + 1 : k + 2])[:, 0]
-    return fA[n : n + made].cpu(), stop
+    return fA[n : n + made].cpu(), stop, score / (made + 1)
 
 
 class StreamDecoder:
@@ -548,22 +565,35 @@ def synthesize_to_file(model, prefix, codec, text, ref_codes, ref_text, out, **o
     return info
 
 
-def synthesize(model, prefix, codec, text, ref_codes, ref_text, temperature=0.7, top_p=0.7, top_k=30, max_frames=1500, strength=0.0, stream=None):
-    prompt = build_drama3_prompt(text, model.tokenizer, model.config, [ref_text], [ref_codes])
+def synthesize(model, prefix, codec, text, ref_codes, ref_text, temperature=0.7, top_p=0.7, top_k=30, max_frames=1500, strength=0.0, stream=None,
+               follow=False):
+    session = getattr(model, "cfg_session", None)
+    turns = session["turns"] if follow and session else []
+    prompt = build_drama3_prompt(text, model.tokenizer, model.config, [ref_text], [ref_codes], turns)
+    while turns and len(prompt) + max_frames > Drama3DecodeGraphs.graph_capacity(model):
+        turns = turns[1:]
+        prompt = build_drama3_prompt(text, model.tokenizer, model.config, [ref_text], [ref_codes], turns)
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     if strength or stream:
-        frames, stop = generate_frames_cfg(model, prefix, prompt, strength, max_frames, temperature, top_k, top_p, stream)
+        frames, stop, pmi = generate_frames_cfg(model, prefix, prompt, strength, max_frames, temperature, top_k, top_p, stream)
         if stream:
             with torch.inference_mode():
                 stream(frames.cuda(), last=True)
     else:
         frames, stop = generate_frames(model, prefix, prompt, max_frames, temperature, top_k, top_p)
+        pmi = None
     elapsed = time.perf_counter() - t0
     codes = frames[:, 1:].T.contiguous()
+    model.cfg_session = None
+    if stop == "eos" and (strength or stream) and model.cfg_graphs is not None:
+        end = torch.zeros((1, prompt.shape[1]), dtype=torch.long)
+        end[0, 0] = model.config.eos_token_id
+        model.cfg_session = {"rows": torch.cat((prompt, frames, end)), "turns": turns + [(text, codes)]}
     with torch.inference_mode():
         audio = codec.from_indices(codes[None].cuda())[0].squeeze().float().cpu().numpy()
-    return audio, {"frames": len(frames), "sec": round(len(audio) / codec.sample_rate, 2), "gen_sec": round(elapsed, 1), "stop": stop}
+    return audio, {"frames": len(frames), "sec": round(len(audio) / codec.sample_rate, 2), "gen_sec": round(elapsed, 1), "stop": stop,
+                   "pmi": None if pmi is None else round(pmi, 4)}
 
 
 def main():

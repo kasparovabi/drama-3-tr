@@ -75,21 +75,21 @@ def load_embedder():
 similarity = load_embedder() if CAMPPLUS else None
 
 
-def speak(text, strength=STRENGTH, ref=REF, best_of=1):
+def speak(text, strength=STRENGTH, ref=REF, best_of=1, temperature=1.0, top_p=0.9, follow=False):
     for en, tr in TAGS.items():
         text = text.replace(en, tr)
     takes = []
     with lock:
         ref_codes, ref_text, prefix = reference(ref)
         if current[0] != ref:
-            prefix.rows = None
+            prefix.rows = model.cfg_session = None
             current[0] = ref
-        tries = best_of if similarity else 1
+        tries = best_of if similarity and not follow else 1
         for n in range(tries + 1):
             if n == tries and any(ok for ok, _, _ in takes):
                 break
-            wave, info = synthesize(model, prefix, codec, text, ref_codes, ref_text, temperature=1.0, top_p=0.9,
-                                    strength=strength, max_frames=frame_cap(text))
+            wave, info = synthesize(model, prefix, codec, text, ref_codes, ref_text, temperature=temperature, top_p=top_p,
+                                    strength=strength, max_frames=frame_cap(text), follow=follow)
             takes.append((info["stop"] == "eos", similarity(wave) if similarity else 0.0, wave))
     print(f"[tts] {info} {' '.join(f'{s:.2f}{"" if ok else "!"}' for ok, s, _ in takes)} {text[:60]}", flush=True)
     return max(takes, key=lambda t: t[:2])[2]
@@ -100,6 +100,7 @@ def frame_cap(text):
 
 
 speak("Merhaba.")
+model.cfg_session = None
 print(f"[tts] READY http://127.0.0.1:{PORT}/tts GPU peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB", flush=True)
 
 
@@ -113,7 +114,8 @@ class Handler(BaseHTTPRequestHandler):
             text = str(req.get("text", ""))
             body = b""
             if any(c.isalnum() for c in text):
-                wave = speak(text, float(req.get("cfg", STRENGTH)), str(req.get("ref") or REF), min(4, max(1, int(req.get("best_of", 1)))))
+                wave = speak(text, float(req.get("cfg", STRENGTH)), str(req.get("ref") or REF), min(4, max(1, int(req.get("best_of", 1)))),
+                             float(req.get("temperature", 1.0)), float(req.get("top_p", 0.9)), bool(req.get("follow")))
                 if req.get("format") == "wav":
                     buf = io.BytesIO()
                     sf.write(buf, wave, codec.sample_rate, format="WAV", subtype="PCM_16")
